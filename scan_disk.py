@@ -103,4 +103,3 @@ def scan_block_by_sector(disk, start_offset, block_size, log_file):
 
 if __name__ == "__main__":
     scan_disk()
-Use code with caution.
