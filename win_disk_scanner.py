@@ -19,7 +19,13 @@ FILE_BEGIN = 0
 INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
+### Что добавлено в этой версии:
+### 1. **Визуальная карта поверхности (78×26 квадратов):** весь выбранный диапазон диска автоматически масштабируется под сетку. Если внутри одного квадрата встретился хоть один медленный или битый сектор, квадрат окрасится в **оранжевый** или **красный** цвет, чтобы вы не пропустили ни одной аномалии.
+### 2. **Выбор диапазона в гигабайтах (`Старт ГБ` / `Конец ГБ`):** при выборе диска поля автоматически заполняются его полным объёмом, но вы можете указать любой отрезок (например, проверить только последние 50 ГБ или конкретную проблемную зону).
+### 3. **Настройка порога задержки прямо в окне:** для старого HDD можно выставить `150–200` мс, а для современного NVMe/SSD — `30–50` мс.
+### 4. **Автоматический дамп в `damages`:** при обнаружении медленных (`slow_LBA_...bin`) или нечитаемых (`damaged_LBA_...bin`) участков скрипт сразу сохраняет их содержимое и дописывает номера битых секторов в `bad_sectors_driveX.txt`.
+### 
+ 
 
 def list_physical_drives():
     """Выводит список физических дисков в Windows через PowerShell."""
@@ -173,3 +179,126 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def _read_bytes(self, handle, size):
+buf = ctypes.create_string_buffer(size)
+read_cnt = wintypes.DWORD(0)
+if not kernel32.ReadFile(handle, buf, size, ctypes.byref(read_cnt), None):
+raise OSError(f"ReadFile error: {ctypes.get_last_error()}")
+return buf.raw[:read_cnt.value]
+def _scan_damaged_block(self, handle, start_offset, block_size, log_file):
+bad_count = 0
+recovered = bytearray()
+start_lba = start_offset // SECTOR_SIZE
+for s_off in range(0, block_size, SECTOR_SIZE):
+if self.stop_event.is_set():
+break
+pos = start_offset + s_off
+lba = pos // SECTOR_SIZE
+try:
+self._set_pointer(handle, pos)
+data = self._read_bytes(handle, SECTOR_SIZE)
+if not data:
+break
+recovered.extend(data)
+except OSError:
+bad_count += 1
+self.log(f"  [ERR] Битый сектор LBA #{lba} (смещение {pos} байт)")
+log_file.write(f"{lba}\n")
+recovered.extend(b"\x00" * SECTOR_SIZE)
+dump_file = os.path.join(OUTPUT_DIR, f"damaged_LBA_{start_lba}.bin")
+with open(dump_file, "wb") as f:
+f.write(recovered)
+return bad_count
+def _scan_worker(self, drive_id, start_offset, end_offset, slow_ms):
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+log_path = os.path.join(OUTPUT_DIR, f"bad_sectors_drive{drive_id}.txt")
+block_size = SECTOR_SIZE * SECTORS_PER_BLOCK
+total_bytes = end_offset - start_offset
+bytes_per_cell = max(block_size, total_bytes // self.max_cells)
+try:
+handle = self._open_disk(drive_id)
+except PermissionError as e:
+self.log(f"ОШИБКА: {e}")
+self._finish_ui("Ошибка прав доступа")
+return
+self.log(f"Старт проверки PhysicalDrive{drive_id} | Диапазон: {start_offset/(10243):.2f} - {end_offset/(10243):.2f} ГБ")
+offset = start_offset
+slow_count = 0
+bad_count = 0
+t_start = time.time()
+current_cell = 0
+cell_worst_color = "#4caf50"
+cell_bytes_acc = 0
+try:
+with open(log_path, "a") as log_file:
+while offset < end_offset and not self.stop_event.is_set():
+read_len = min(block_size, end_offset - offset)
+# Выравнивание размера чтения по сектору
+read_len = (read_len // SECTOR_SIZE) * SECTOR_SIZE
+if read_len == 0:
+break
+t0 = time.perf_counter()
+try:
+self._set_pointer(handle, offset)
+data = self._read_bytes(handle, read_len)
+dt_ms = (time.perf_counter() - t0) * 1000
+if not data:
+break
+if dt_ms > slow_ms:
+slow_count += 1
+lba = offset // SECTOR_SIZE
+self.log(f"[МЕДЛЕННО] LBA #{lba} ({dt_ms:.1f} мс) -> сохранено в {OUTPUT_DIR}")
+slow_path = os.path.join(OUTPUT_DIR, f"slow_LBA_{lba}_{int(dt_ms)}ms.bin")
+with open(slow_path, "wb") as sf:
+sf.write(data)
+block_color = "#ff9800"
+elif dt_ms > 80:
+block_color = "#ffeb3b"
+elif dt_ms > 30:
+block_color = "#8bc34a"
+else:
+block_color = "#4caf50"
+except OSError:
+self.log(f"[СБОЙ] Ошибка чтения на смещении {offset}. Анализ по секторам...")
+b_found = self._scan_damaged_block(handle, offset, read_len, log_file)
+bad_count += b_found
+block_color = "#f44336"
+# Приоритет цвета для ячейки карты (красный > оранжевый > жёлтый > зелёный)
+priority = {"#4caf50": 1, "#8bc34a": 2, "#ffeb3b": 3, "#ff9800": 4, "#f44336": 5}
+if priority[block_color] > priority[cell_worst_color]:
+cell_worst_color = block_color
+cell_bytes_acc += read_len
+if cell_bytes_acc >= bytes_per_cell:
+self.draw_cell(current_cell, cell_worst_color)
+current_cell += 1
+cell_bytes_acc = 0
+cell_worst_color = "#4caf50"
+offset += read_len
+# Обновление прогресса
+scanned = offset - start_offset
+pct = (scanned / total_bytes) * 100
+elapsed = max(0.1, time.time() - t_start)
+speed_mb = (scanned / (1024 ** 2)) / elapsed
+self.progress_var.set(pct)
+self.stats_text.set(
+f"Проверено: {scanned/(10243):.2f} / {total_bytes/(10243):.2f} ГБ ({pct:.1f}%) | "
+f"Скорость: {speed_mb:.1f} МБ/с | Медленных: {slow_count} | Битых: {bad_count}"
+)
+if cell_bytes_acc > 0 and current_cell < self.max_cells:
+self.draw_cell(current_cell, cell_worst_color)
+finally:
+kernel32.CloseHandle(handle)
+status = "Остановлено пользователем" if self.stop_event.is_set() else "Сканирование завершено!"
+self.log(f"\n=== {status} Медленных: {slow_count}, Битых секторов: {bad_count} ===")
+self._finish_ui(status)
+def _finish_ui(self, status_text):
+self.is_scanning = False
+self.root.after(0, lambda: self.start_btn.configure(state="normal"))
+self.root.after(0, lambda: self.stop_btn.configure(state="disabled"))
+self.root.after(0, lambda: self.status_label.configure(text=status_text, foreground="black"))
+if name == "main":
+root = tk.Tk()
+app = DiskScannerGUI(root)
+root.mainloop()
